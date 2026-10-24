@@ -3,39 +3,61 @@ import uuid
 
 from fastapi import APIRouter, HTTPException
 
+from app.providers import get_provider
+from app.registry import get_registry
 from app.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     Choice,
+    ModelCard,
+    ModelList,
     ResponseMessage,
-    Usage,
 )
 
 router = APIRouter()
 
 
+@router.get("/v1/models", response_model=ModelList)
+def list_models():
+    models = get_registry().list_models()
+    return ModelList(
+        data=[ModelCard(id=m.id, owned_by=m.provider) for m in models]
+    )
+
+
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest):
     if request.stream:
         raise HTTPException(
             status_code=501,
             detail="Streaming is not implemented yet.",
         )
 
-    # PLACEHOLDER: hardcoded response. No provider is called yet.
+    model = get_registry().resolve(request.model)
+    if model is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{request.model}' is not configured.",
+        )
+
+    provider = get_provider(model.provider)
+    result = await provider.generate(
+        model_id=model.id,
+        messages=request.messages,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+    )
+
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         created=int(time.time()),
-        model=request.model,  # PLACEHOLDER: echoes request; no routing yet
+        model=model.id,
         choices=[
             Choice(
                 index=0,
-                message=ResponseMessage(
-                    content="[PLACEHOLDER] This is a hardcoded response."
-                ),
-                finish_reason="stop",
+                message=ResponseMessage(content=result.content),
+                finish_reason=result.finish_reason,
             )
         ],
-        # PLACEHOLDER: fake usage values, not real token counts.
-        usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        usage=result.usage,
     )

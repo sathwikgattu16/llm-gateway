@@ -1,0 +1,16 @@
+# Model registry. One entry per model the gateway can serve.
+# IDs are our target list; they must be verified against live provider
+# catalogs in Milestone 3 before real use.
+models:
+  - id: gemini-3.8-flash
+    provider: gemini
+  - id: gemini-3.7-flash
+    provider: gemini
+  - id: gemini-3.5-flash-lite
+    provider: gemini
+  - id: openai/gpt-oss-20b
+    provider: groq
+  - id: openai/gpt-oss-120b
+    provider: groq
+  - id: qwen/qwen3.8-27b
+    provider: groq

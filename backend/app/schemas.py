@@ -30,9 +30,10 @@ class Choice(BaseModel):
 
 
 class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
+    # None means "unknown", never a fake zero.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -41,4 +42,15 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[Choice]
-    usage: Usage
+    usage: Usage | None = None
+
+
+class ModelCard(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    owned_by: str
+
+
+class ModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelCard]
