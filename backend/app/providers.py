@@ -1,5 +1,9 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
+
+from fastapi import HTTPException
+import httpx
 
 from app.schemas import ChatMessage, Usage
 
@@ -11,6 +15,38 @@ class ProviderResult:
     content: str
     finish_reason: str
     usage: Usage | None  # None = unknown (never a fake zero)
+
+
+class ProviderError(HTTPException):
+    """Base exception for provider failures, mapped to an HTTP status code."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(status_code=status_code, detail=detail)
+
+
+class AuthenticationError(ProviderError):
+    def __init__(self, detail: str = "Groq authentication failed."):
+        super().__init__(status_code=401, detail=detail)
+
+
+class RateLimitError(ProviderError):
+    def __init__(self, detail: str = "Groq rate limit exceeded."):
+        super().__init__(status_code=429, detail=detail)
+
+
+class ModelNotFoundError(ProviderError):
+    def __init__(self, detail: str = "Groq model not found."):
+        super().__init__(status_code=404, detail=detail)
+
+
+class ProviderTimeoutError(ProviderError):
+    def __init__(self, detail: str = "Groq request timed out."):
+        super().__init__(status_code=504, detail=detail)
+
+
+class UpstreamProviderError(ProviderError):
+    def __init__(self, detail: str = "Groq upstream server error."):
+        super().__init__(status_code=502, detail=detail)
 
 
 class Provider(ABC):
@@ -45,11 +81,180 @@ class FakeProvider(Provider):
         )
 
 
-# Milestone 2: every provider name maps to the fake. Milestone 3 swaps in
-# real Groq/Gemini adapters here.
+class GroqProvider(Provider):
+    """Real Groq provider using Groq's OpenAI-compatible Chat Completions API."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str = "https://api.groq.com/openai/v1",
+        timeout: float = 30.0,
+        http_client: httpx.AsyncClient | None = None,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._http_client = http_client
+
+    def __repr__(self) -> str:
+        return f"<GroqProvider base_url='{self.base_url}'>"
+
+    def _resolve_api_key(self) -> str:
+        raw_key = self.api_key if self.api_key is not None else os.environ.get("GROQ_API_KEY")
+        if not raw_key or not raw_key.strip():
+            raise AuthenticationError("GROQ_API_KEY environment variable is missing.")
+        return raw_key.strip()
+
+    def _redact(self, text: str, key: str | None) -> str:
+        if key and key.strip() and key in text:
+            return text.replace(key, "[REDACTED]")
+        return text
+
+    async def generate(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ProviderResult:
+        api_key = self._resolve_api_key()
+
+        payload: dict = {
+            "model": model_id,
+            "messages": [
+                {"role": msg.role, "content": msg.content} for msg in messages
+            ],
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{self.base_url}/chat/completions"
+
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.post(
+                    url, json=payload, headers=headers, timeout=self.timeout
+                )
+            else:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+        except httpx.TimeoutException as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise ProviderTimeoutError(f"Request to Groq timed out: {clean_exc}") from exc
+        except httpx.RequestError as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise UpstreamProviderError(
+                f"Failed to communicate with Groq: {clean_exc}"
+            ) from exc
+
+        if response.status_code != 200:
+            self._handle_error_response(response, model_id, api_key)
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise UpstreamProviderError(
+                "Malformed response from Groq: invalid JSON."
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise UpstreamProviderError(
+                "Malformed response from Groq: expected JSON object."
+            )
+
+        return self._parse_response(data)
+
+    def _handle_error_response(
+        self, response: httpx.Response, model_id: str, api_key: str | None = None
+    ) -> None:
+        try:
+            error_json = response.json()
+            error_obj = error_json.get("error", {})
+            if isinstance(error_obj, dict):
+                message = error_obj.get("message") or response.text
+            else:
+                message = str(error_obj)
+        except Exception:
+            message = response.text
+
+        key_to_redact = api_key or self.api_key or os.environ.get("GROQ_API_KEY")
+        if key_to_redact and key_to_redact.strip():
+            message = self._redact(message, key_to_redact.strip())
+
+        status = response.status_code
+        if status == 401:
+            raise AuthenticationError(f"Groq authentication failed: {message}")
+        elif status == 404:
+            raise ModelNotFoundError(
+                f"Groq model '{model_id}' was not found: {message}"
+            )
+        elif status == 429:
+            raise RateLimitError(f"Groq rate limit exceeded: {message}")
+        elif status >= 500:
+            raise UpstreamProviderError(
+                f"Groq upstream error ({status}): {message}"
+            )
+        else:
+            raise ProviderError(
+                status_code=status, detail=f"Groq API error ({status}): {message}"
+            )
+
+    def _parse_response(self, data: dict) -> ProviderResult:
+        choices = data.get("choices")
+        if not choices or not isinstance(choices, list):
+            raise UpstreamProviderError(
+                "Malformed response from Groq: missing choices."
+            )
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise UpstreamProviderError(
+                "Malformed response from Groq: malformed choice object."
+            )
+
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise UpstreamProviderError(
+                "Malformed response from Groq: malformed message object."
+            )
+
+        raw_content = message.get("content")
+        content = "" if raw_content is None else str(raw_content)
+
+        raw_finish_reason = choice.get("finish_reason")
+        finish_reason = "stop" if not raw_finish_reason else str(raw_finish_reason)
+
+        usage = None
+        usage_data = data.get("usage")
+        if isinstance(usage_data, dict):
+            p = usage_data.get("prompt_tokens")
+            c = usage_data.get("completion_tokens")
+            t = usage_data.get("total_tokens")
+            if p is not None or c is not None or t is not None:
+                usage = Usage(
+                    prompt_tokens=p if isinstance(p, int) else None,
+                    completion_tokens=c if isinstance(c, int) else None,
+                    total_tokens=t if isinstance(t, int) else None,
+                )
+
+        return ProviderResult(
+            content=content,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+
+
+# Milestone 3: Groq is real; Gemini remains FakeProvider.
 _PROVIDERS: dict[str, Provider] = {
     "gemini": FakeProvider(),
-    "groq": FakeProvider(),
+    "groq": GroqProvider(),
 }
 
 
