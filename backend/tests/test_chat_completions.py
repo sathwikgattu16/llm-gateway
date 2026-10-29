@@ -8,19 +8,25 @@ VALID_BODY = {"messages": [{"role": "user", "content": "Hello"}]}
 
 
 def test_valid_request_returns_expected_structure():
-    response = client.post("/v1/chat/completions", json=VALID_BODY)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["object"] == "chat.completion"
-    assert data["id"].startswith("chatcmpl-")
-    assert data["model"] == "gemini-3.8-flash"  # "auto" placeholder: first model
-    assert isinstance(data["created"], int)
-    assert len(data["choices"]) == 1
-    choice = data["choices"][0]
-    assert choice["index"] == 0
-    assert choice["message"]["role"] == "assistant"
-    assert isinstance(choice["message"]["content"], str)
-    assert choice["finish_reason"] == "stop"
+    from unittest.mock import AsyncMock, patch
+    from app.providers import ProviderResult
+
+    fake_result = ProviderResult(content="Mocked Gemini response", finish_reason="stop", usage=None)
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = fake_result
+        response = client.post("/v1/chat/completions", json=VALID_BODY)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["object"] == "chat.completion"
+        assert data["id"].startswith("chatcmpl-")
+        assert data["model"] == "gemini-3.8-flash"  # "auto" placeholder: first model
+        assert isinstance(data["created"], int)
+        assert len(data["choices"]) == 1
+        choice = data["choices"][0]
+        assert choice["index"] == 0
+        assert choice["message"]["role"] == "assistant"
+        assert isinstance(choice["message"]["content"], str)
+        assert choice["finish_reason"] == "stop"
 
 
 def test_explicit_model_is_used(monkeypatch):
@@ -45,8 +51,14 @@ def test_unknown_model_returns_404():
 
 
 def test_usage_is_unknown_not_fake():
-    data = client.post("/v1/chat/completions", json=VALID_BODY).json()
-    assert data["usage"] is None
+    from unittest.mock import AsyncMock, patch
+    from app.providers import ProviderResult
+
+    fake_result = ProviderResult(content="Mocked response", finish_reason="stop", usage=None)
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = fake_result
+        data = client.post("/v1/chat/completions", json=VALID_BODY).json()
+        assert data["usage"] is None
 
 
 def test_empty_messages_rejected():
@@ -151,3 +163,93 @@ def test_groq_route_redacts_api_key_in_error_detail():
         detail = response.json()["detail"]
         assert secret_key not in detail
         assert "[REDACTED]" in detail
+
+
+def test_gemini_explicit_model_is_used():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import ProviderResult
+
+    body = {**VALID_BODY, "model": "gemini-3.7-flash"}
+    fake_result = ProviderResult(content="Mocked Gemini response", finish_reason="stop", usage=None)
+
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = fake_result
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 200
+        assert response.json()["model"] == "gemini-3.7-flash"
+
+
+def test_gemini_route_authentication_error_401():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import AuthenticationError
+
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = AuthenticationError("Gemini authentication failed: API key not valid.")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 401
+        assert "authentication failed" in response.json()["detail"].lower()
+
+
+def test_gemini_route_model_not_found_404():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import ModelNotFoundError
+
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = ModelNotFoundError("Gemini model not found.")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+
+def test_gemini_route_rate_limit_429():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import RateLimitError
+
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = RateLimitError("Gemini rate limit exceeded.")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 429
+        assert "rate limit" in response.json()["detail"].lower()
+
+
+def test_gemini_route_upstream_server_error_502():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import UpstreamProviderError
+
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = UpstreamProviderError("Gemini upstream server error.")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 502
+        assert "upstream" in response.json()["detail"].lower()
+
+
+def test_gemini_route_timeout_error_504():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import ProviderTimeoutError
+
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = ProviderTimeoutError("Gemini request timed out.")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 504
+        assert "timed out" in response.json()["detail"].lower()
+
+
+def test_gemini_route_redacts_api_key_in_error_detail():
+    from unittest.mock import AsyncMock, patch
+    from app.providers import AuthenticationError
+
+    secret_key = "AIzaSy_gemini_secret_123456"
+    body = {**VALID_BODY, "model": "gemini-3.8-flash"}
+    with patch("app.providers.GeminiProvider.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = AuthenticationError("Gemini authentication failed: [REDACTED]")
+        response = client.post("/v1/chat/completions", json=body)
+        assert response.status_code == 401
+        detail = response.json()["detail"]
+        assert secret_key not in detail
+        assert "[REDACTED]" in detail
+
