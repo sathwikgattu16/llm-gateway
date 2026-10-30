@@ -23,10 +23,21 @@ class ResponseMessage(BaseModel):
     content: str
 
 
+class ChoiceDelta(BaseModel):
+    role: Literal["assistant"] | None = None
+    content: str | None = None
+
+
 class Choice(BaseModel):
     index: int
     message: ResponseMessage
     finish_reason: str
+
+
+class ChunkChoice(BaseModel):
+    index: int
+    delta: ChoiceDelta
+    finish_reason: str | None = None
 
 
 class Usage(BaseModel):
@@ -42,6 +53,15 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[Choice]
+    usage: Usage | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChunkChoice]
     usage: Usage | None = None
 
 

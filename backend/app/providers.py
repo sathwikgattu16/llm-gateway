@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import json
 import os
+from typing import AsyncIterator
 
 from fastapi import HTTPException
 import httpx
@@ -17,6 +19,15 @@ class ProviderResult:
     usage: Usage | None  # None = unknown (never a fake zero)
 
 
+@dataclass
+class ProviderChunk:
+    """Normalized chunk yielded by an asynchronous provider stream."""
+
+    delta: str = ""
+    finish_reason: str | None = None
+    usage: Usage | None = None
+
+
 class ProviderError(HTTPException):
     """Base exception for provider failures, mapped to an HTTP status code."""
 
@@ -25,27 +36,27 @@ class ProviderError(HTTPException):
 
 
 class AuthenticationError(ProviderError):
-    def __init__(self, detail: str = "Groq authentication failed."):
+    def __init__(self, detail: str = "Authentication failed."):
         super().__init__(status_code=401, detail=detail)
 
 
 class RateLimitError(ProviderError):
-    def __init__(self, detail: str = "Groq rate limit exceeded."):
+    def __init__(self, detail: str = "Rate limit exceeded."):
         super().__init__(status_code=429, detail=detail)
 
 
 class ModelNotFoundError(ProviderError):
-    def __init__(self, detail: str = "Groq model not found."):
+    def __init__(self, detail: str = "Model not found."):
         super().__init__(status_code=404, detail=detail)
 
 
 class ProviderTimeoutError(ProviderError):
-    def __init__(self, detail: str = "Groq request timed out."):
+    def __init__(self, detail: str = "Request timed out."):
         super().__init__(status_code=504, detail=detail)
 
 
 class UpstreamProviderError(ProviderError):
-    def __init__(self, detail: str = "Groq upstream server error."):
+    def __init__(self, detail: str = "Upstream server error."):
         super().__init__(status_code=502, detail=detail)
 
 
@@ -61,6 +72,16 @@ class Provider(ABC):
         max_tokens: int | None = None,
     ) -> ProviderResult:
         """Return one complete (non-streaming) answer."""
+
+    @abstractmethod
+    async def generate_stream(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[ProviderChunk]:
+        """Yield normalized chunks as they arrive from the upstream provider."""
 
 
 class FakeProvider(Provider):
@@ -79,6 +100,21 @@ class FakeProvider(Provider):
             finish_reason="stop",
             usage=None,
         )
+
+    async def generate_stream(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[ProviderChunk]:
+        last = messages[-1].content
+        echo_text = f"[FAKE:{model_id}] Echo: {last}"
+        words = echo_text.split(" ")
+        for i, word in enumerate(words):
+            chunk_text = word if i == 0 else f" {word}"
+            yield ProviderChunk(delta=chunk_text)
+        yield ProviderChunk(finish_reason="stop", usage=None)
 
 
 class GroqProvider(Provider):
@@ -170,6 +206,117 @@ class GroqProvider(Provider):
             )
 
         return self._parse_response(data)
+
+    async def generate_stream(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[ProviderChunk]:
+        api_key = self._resolve_api_key()
+
+        payload: dict = {
+            "model": model_id,
+            "messages": [
+                {"role": msg.role, "content": msg.content} for msg in messages
+            ],
+            "stream": True,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{self.base_url}/chat/completions"
+
+        client = self._http_client or httpx.AsyncClient(timeout=self.timeout)
+        client_owned = self._http_client is None
+
+        try:
+            async with client.stream(
+                "POST", url, json=payload, headers=headers, timeout=self.timeout
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    self._handle_error_response(response, model_id, api_key)
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        raw_data = line[len("data:"):].strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            chunk_data = json.loads(raw_data)
+                        except Exception as exc:
+                            raise UpstreamProviderError(
+                                "Malformed SSE chunk from Groq: invalid JSON."
+                            ) from exc
+
+                        if not isinstance(chunk_data, dict):
+                            raise UpstreamProviderError(
+                                "Malformed SSE chunk from Groq: expected JSON object."
+                            )
+
+                        delta_text = ""
+                        finish_reason = None
+                        usage = None
+
+                        choices = chunk_data.get("choices")
+                        if (
+                            choices
+                            and isinstance(choices, list)
+                            and isinstance(choices[0], dict)
+                        ):
+                            choice = choices[0]
+                            delta_obj = choice.get("delta")
+                            if isinstance(delta_obj, dict):
+                                raw_content = delta_obj.get("content")
+                                if raw_content:
+                                    delta_text = str(raw_content)
+                            raw_finish = choice.get("finish_reason")
+                            if raw_finish:
+                                finish_reason = str(raw_finish)
+
+                        usage_data = chunk_data.get("usage")
+                        if isinstance(usage_data, dict):
+                            p = usage_data.get("prompt_tokens")
+                            c = usage_data.get("completion_tokens")
+                            t = usage_data.get("total_tokens")
+                            if p is not None or c is not None or t is not None:
+                                usage = Usage(
+                                    prompt_tokens=p if isinstance(p, int) else None,
+                                    completion_tokens=c if isinstance(c, int) else None,
+                                    total_tokens=t if isinstance(t, int) else None,
+                                )
+
+                        if delta_text or finish_reason is not None or usage is not None:
+                            yield ProviderChunk(
+                                delta=delta_text,
+                                finish_reason=finish_reason,
+                                usage=usage,
+                            )
+        except httpx.TimeoutException as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise ProviderTimeoutError(
+                f"Request to Groq timed out: {clean_exc}"
+            ) from exc
+        except httpx.RequestError as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise UpstreamProviderError(
+                f"Failed to communicate with Groq: {clean_exc}"
+            ) from exc
+        finally:
+            if client_owned:
+                await client.aclose()
 
     def _handle_error_response(
         self, response: httpx.Response, model_id: str, api_key: str | None = None
@@ -397,6 +544,144 @@ class GeminiProvider(Provider):
 
         return self._parse_response(data)
 
+    async def generate_stream(
+        self,
+        model_id: str,
+        messages: list[ChatMessage],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[ProviderChunk]:
+        api_key = self._resolve_api_key()
+
+        payload = self._build_payload(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+
+        clean_model = (
+            model_id if model_id.startswith("models/") else f"models/{model_id}"
+        )
+        url = f"{self.base_url}/{clean_model}:streamGenerateContent?alt=sse"
+
+        client = self._http_client or httpx.AsyncClient(timeout=self.timeout)
+        client_owned = self._http_client is None
+
+        try:
+            async with client.stream(
+                "POST", url, json=payload, headers=headers, timeout=self.timeout
+            ) as response:
+                if response.status_code != 200:
+                    await response.aread()
+                    self._handle_error_response(response, model_id, api_key)
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        raw_data = line[len("data:"):].strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            chunk_data = json.loads(raw_data)
+                        except Exception as exc:
+                            raise UpstreamProviderError(
+                                "Malformed SSE chunk from Gemini: invalid JSON."
+                            ) from exc
+
+                        if not isinstance(chunk_data, dict):
+                            raise UpstreamProviderError(
+                                "Malformed SSE chunk from Gemini: expected JSON object."
+                            )
+
+                        prompt_feedback = chunk_data.get("promptFeedback")
+                        if isinstance(prompt_feedback, dict):
+                            block_reason = prompt_feedback.get("blockReason")
+                            if block_reason:
+                                raise UpstreamProviderError(
+                                    f"Gemini blocked prompt: {block_reason}."
+                                )
+
+                        delta_text = ""
+                        finish_reason = None
+                        usage = None
+
+                        candidates = chunk_data.get("candidates")
+                        if candidates is not None:
+                            if not isinstance(candidates, list):
+                                raise UpstreamProviderError(
+                                    "Malformed SSE chunk from Gemini: candidates must be a list."
+                                )
+                            if len(candidates) > 0:
+                                candidate = candidates[0]
+                                if not isinstance(candidate, dict):
+                                    raise UpstreamProviderError(
+                                        "Malformed SSE chunk from Gemini: malformed candidate object."
+                                    )
+                                content_obj = candidate.get("content")
+                                if isinstance(content_obj, dict):
+                                    parts = content_obj.get("parts")
+                                    if isinstance(parts, list):
+                                        delta_text = "".join(
+                                            str(part.get("text", ""))
+                                            for part in parts
+                                            if isinstance(part, dict) and "text" in part
+                                        )
+
+                                raw_finish_reason = candidate.get("finishReason")
+                                if raw_finish_reason == "STOP":
+                                    finish_reason = "stop"
+                                elif raw_finish_reason == "MAX_TOKENS":
+                                    finish_reason = "length"
+                                elif raw_finish_reason in (
+                                    "SAFETY",
+                                    "RECITATION",
+                                    "BLOCKLIST",
+                                    "PROHIBITED_CONTENT",
+                                    "SPII",
+                                ):
+                                    finish_reason = "content_filter"
+                                elif raw_finish_reason:
+                                    finish_reason = str(raw_finish_reason).lower()
+
+                        usage_data = chunk_data.get("usageMetadata")
+                        if isinstance(usage_data, dict):
+                            p = usage_data.get("promptTokenCount")
+                            c = usage_data.get("candidatesTokenCount")
+                            t = usage_data.get("totalTokenCount")
+                            if p is not None or c is not None or t is not None:
+                                usage = Usage(
+                                    prompt_tokens=p if isinstance(p, int) else None,
+                                    completion_tokens=c if isinstance(c, int) else None,
+                                    total_tokens=t if isinstance(t, int) else None,
+                                )
+
+                        if delta_text or finish_reason is not None or usage is not None:
+                            yield ProviderChunk(
+                                delta=delta_text,
+                                finish_reason=finish_reason,
+                                usage=usage,
+                            )
+        except httpx.TimeoutException as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise ProviderTimeoutError(
+                f"Request to Gemini timed out: {clean_exc}"
+            ) from exc
+        except httpx.RequestError as exc:
+            clean_exc = self._redact(str(exc), api_key)
+            raise UpstreamProviderError(
+                f"Failed to communicate with Gemini: {clean_exc}"
+            ) from exc
+        finally:
+            if client_owned:
+                await client.aclose()
+
     def _handle_error_response(
         self,
         response: httpx.Response,
@@ -519,4 +804,3 @@ _PROVIDERS: dict[str, Provider] = {
 
 def get_provider(name: str) -> Provider:
     return _PROVIDERS[name]
-

@@ -627,3 +627,413 @@ async def test_gemini_redacts_api_key_in_exception_messages():
 
     assert secret_key not in exc_info2.value.detail
     assert "[REDACTED]" in exc_info2.value.detail
+
+
+# --- Milestone 5: Gemini Streaming Tests ---
+
+from app.providers import ProviderChunk
+
+
+GEMINI_STREAMING_MOCK_CHUNKS = (
+    'data: {"candidates":[{"content":{"parts":[{"text":"Tokyo"}],"role":"model"}}]}\n\n'
+    ': ping\n\n'
+    'data: {"candidates":[{"content":{"parts":[{"text":" is the capital of Japan."}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":8,"totalTokenCount":22}}\n\n'
+    '\n\n'
+)
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_success_normalization():
+    captured_url = None
+    captured_payload = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_url, captured_payload
+        assert request.headers["x-goog-api-key"] == "test-key"
+        assert request.headers["Content-Type"] == "application/json"
+        captured_url = str(request.url)
+        captured_payload = json.loads(request.content)
+        return httpx.Response(200, text=GEMINI_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    chunks = []
+    async for chunk in provider.generate_stream(
+        model_id="gemini-3.8-flash",
+        messages=[ChatMessage(role="user", content="Capital of Japan?")],
+        temperature=0.4,
+        max_tokens=60,
+    ):
+        assert isinstance(chunk, ProviderChunk)
+        chunks.append(chunk)
+
+    assert "models/gemini-3.8-flash:streamGenerateContent?alt=sse" in captured_url
+    assert captured_payload["generationConfig"]["temperature"] == 0.4
+    assert captured_payload["generationConfig"]["maxOutputTokens"] == 60
+    assert captured_payload["contents"][0]["parts"][0]["text"] == "Capital of Japan?"
+
+    assert len(chunks) == 2
+    assert chunks[0].delta == "Tokyo"
+    assert chunks[0].finish_reason is None
+    assert chunks[0].usage is None
+
+    assert chunks[1].delta == " is the capital of Japan."
+    assert chunks[1].finish_reason == "stop"
+    assert chunks[1].usage is not None
+    assert chunks[1].usage.prompt_tokens == 14
+    assert chunks[1].usage.completion_tokens == 8
+    assert chunks[1].usage.total_tokens == 22
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_model_prefix_handling():
+    captured_paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_paths.append(request.url.path)
+        return httpx.Response(200, text=GEMINI_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    async for _ in provider.generate_stream(
+        model_id="gemini-3.7-flash",
+        messages=[ChatMessage(role="user", content="Hi")],
+    ):
+        pass
+    assert captured_paths[-1] == "/v1beta/models/gemini-3.7-flash:streamGenerateContent"
+
+    async for _ in provider.generate_stream(
+        model_id="models/gemini-3.7-flash",
+        messages=[ChatMessage(role="user", content="Hi")],
+    ):
+        pass
+    assert captured_paths[-1] == "/v1beta/models/gemini-3.7-flash:streamGenerateContent"
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_system_instruction_and_roles_mapping():
+    captured_payload = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_payload
+        captured_payload = json.loads(request.content)
+        return httpx.Response(200, text=GEMINI_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    messages = [
+        ChatMessage(role="system", content="System instruction text"),
+        ChatMessage(role="user", content="User text"),
+        ChatMessage(role="assistant", content="Assistant reply"),
+    ]
+
+    async for _ in provider.generate_stream(
+        model_id="gemini-3.8-flash",
+        messages=messages,
+    ):
+        pass
+
+    assert captured_payload["systemInstruction"] == {"parts": [{"text": "System instruction text"}]}
+    contents = captured_payload["contents"]
+    assert len(contents) == 2
+    assert contents[0] == {"role": "user", "parts": [{"text": "User text"}]}
+    assert contents[1] == {"role": "model", "parts": [{"text": "Assistant reply"}]}
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_finish_reason_mappings():
+    test_cases = [
+        ("MAX_TOKENS", "length"),
+        ("SAFETY", "content_filter"),
+        ("RECITATION", "content_filter"),
+        ("BLOCKLIST", "content_filter"),
+        ("PROHIBITED_CONTENT", "content_filter"),
+        ("SPII", "content_filter"),
+        ("OTHER", "other"),
+    ]
+
+    for gemini_reason, expected in test_cases:
+        sse_text = f'data: {{"candidates": [{{"content": {{"parts": [{{"text": "Text"}}]}}, "finishReason": "{gemini_reason}"}}]}}\n\n'
+
+        def handler(request: httpx.Request, payload=sse_text) -> httpx.Response:
+            return httpx.Response(200, text=payload)
+
+        mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+        chunks = []
+        async for chunk in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            chunks.append(chunk)
+
+        assert chunks[0].finish_reason == expected
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_prompt_blocked_safety():
+    blocked_sse = (
+        'data: {"promptFeedback": {"blockReason": "SAFETY", "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS", "probability": "HIGH"}]}}\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=blocked_sse)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Blocked query")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "SAFETY" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_missing_api_key_raises_auth_error(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    provider = GeminiProvider(api_key=None)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 401
+    assert "GEMINI_API_KEY" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_auth_error_401():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"code": 401, "message": "API key not valid.", "status": "UNAUTHENTICATED"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="bad-key", http_client=mock_client)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 401
+    assert "API key not valid" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_auth_error_403():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"error": {"code": 403, "message": "Permission denied for project.", "status": "PERMISSION_DENIED"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="bad-key", http_client=mock_client)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 401
+    assert "authentication failed" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_invalid_model_404():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={"error": {"code": 404, "message": "models/non-existent is not found", "status": "NOT_FOUND"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(ModelNotFoundError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="non-existent",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 404
+    assert "non-existent" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_rate_limit_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(RateLimitError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 429
+    assert "rate limit" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_upstream_500():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"error": {"code": 500, "message": "Internal error occurred", "status": "INTERNAL"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "upstream error" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("Stream read timed out")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 504
+    assert "timed out" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_network_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Network connection reset")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "failed to communicate" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_malformed_json_chunk():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: {invalid json\n\n")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "invalid JSON" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_non_dict_chunk():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: [\"chunk1\", \"chunk2\"]\n\n")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "expected JSON object" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_redacts_api_key_in_exceptions():
+    secret_key = "AIzaSy_stream_gemini_secret_998877"
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"Read timed out connecting with key {secret_key}")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler))
+    provider = GeminiProvider(api_key=secret_key, http_client=mock_client)
+
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="gemini-3.8-flash",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert secret_key not in exc_info.value.detail
+    assert "[REDACTED]" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_gemini_streaming_cleanup_on_early_termination():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=GEMINI_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GeminiProvider(api_key="test-key", http_client=mock_client)
+
+    stream = provider.generate_stream(
+        model_id="gemini-3.8-flash",
+        messages=[ChatMessage(role="user", content="Hi")],
+    )
+
+    first = await anext(stream)
+    assert first.delta == "Tokyo"
+    # Close early (simulating disconnect or break)
+    await stream.aclose()

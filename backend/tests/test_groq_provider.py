@@ -729,3 +729,286 @@ async def test_groq_connect_timeout_raises_provider_timeout_error():
 
     assert exc_info.value.status_code == 504
     assert "timed out" in exc_info.value.detail.lower()
+
+
+# --- Milestone 5: Groq Streaming Tests ---
+
+from app.providers import ProviderChunk
+
+
+GROQ_STREAMING_MOCK_CHUNKS = (
+    'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant","content":"Paris"},"finish_reason":null}]}\n\n'
+    ': keep-alive\n\n'
+    'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":" is"},"finish_reason":null}]}\n\n'
+    '\n\n'
+    'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":" the capital."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":6,"total_tokens":18}}\n\n'
+    'data: [DONE]\n\n'
+    'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"ignored"},"finish_reason":null}]}\n\n'
+)
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_success_normalization():
+    captured_payload = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_payload
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert request.url.path == "/openai/v1/chat/completions"
+        captured_payload = json.loads(request.content)
+        return httpx.Response(200, text=GROQ_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    chunks = []
+    async for chunk in provider.generate_stream(
+        model_id="openai/gpt-oss-20b",
+        messages=[ChatMessage(role="user", content="Capital of France?")],
+        temperature=0.3,
+        max_tokens=50,
+    ):
+        assert isinstance(chunk, ProviderChunk)
+        chunks.append(chunk)
+
+    assert captured_payload["stream"] is True
+    assert captured_payload["model"] == "openai/gpt-oss-20b"
+    assert captured_payload["temperature"] == 0.3
+    assert captured_payload["max_tokens"] == 50
+
+    # 3 chunks: "Paris", " is", " the capital."
+    assert len(chunks) == 3
+    assert chunks[0].delta == "Paris"
+    assert chunks[0].finish_reason is None
+    assert chunks[0].usage is None
+
+    assert chunks[1].delta == " is"
+    assert chunks[1].finish_reason is None
+    assert chunks[1].usage is None
+
+    assert chunks[2].delta == " the capital."
+    assert chunks[2].finish_reason == "stop"
+    assert chunks[2].usage is not None
+    assert chunks[2].usage.prompt_tokens == 12
+    assert chunks[2].usage.completion_tokens == 6
+    assert chunks[2].usage.total_tokens == 18
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_missing_key_raises_auth_error(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    provider = GroqProvider(api_key=None)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 401
+    assert "GROQ_API_KEY" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_auth_error_401():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"message": "Invalid API Key provided.", "type": "invalid_request_error"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="bad-key", http_client=mock_client)
+
+    with pytest.raises(AuthenticationError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 401
+    assert "Invalid API Key" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_model_not_found_404():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={"error": {"message": "The model `missing-model` does not exist", "code": "model_not_found"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(ModelNotFoundError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="missing-model",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 404
+    assert "missing-model" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_rate_limit_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"message": "Rate limit reached.", "type": "tokens"}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(RateLimitError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 429
+    assert "rate limit" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_upstream_500():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={"error": {"message": "Groq internal server crash."}},
+        )
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "upstream error" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("Stream read timeout after 30s")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 504
+    assert "timed out" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_network_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Network connection reset")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "failed to communicate" in exc_info.value.detail.lower()
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_malformed_json_chunk():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: {invalid json content}\n\n")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "invalid JSON" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_non_dict_chunk():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: [\"item1\", \"item2\"]\n\n")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    with pytest.raises(UpstreamProviderError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert exc_info.value.status_code == 502
+    assert "expected JSON object" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_redacts_api_key_in_exceptions():
+    secret_key = "gsk_stream_secret_key_112233"
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"Read timed out connecting with key {secret_key}")
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler))
+    provider = GroqProvider(api_key=secret_key, http_client=mock_client)
+
+    with pytest.raises(ProviderTimeoutError) as exc_info:
+        async for _ in provider.generate_stream(
+            model_id="openai/gpt-oss-20b",
+            messages=[ChatMessage(role="user", content="Hi")],
+        ):
+            pass
+
+    assert secret_key not in exc_info.value.detail
+    assert "[REDACTED]" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_groq_streaming_cleanup_on_early_termination():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=GROQ_STREAMING_MOCK_CHUNKS)
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = GroqProvider(api_key="test-key", http_client=mock_client)
+
+    stream = provider.generate_stream(
+        model_id="openai/gpt-oss-20b",
+        messages=[ChatMessage(role="user", content="Hi")],
+    )
+
+    first = await anext(stream)
+    assert first.delta == "Paris"
+    # Close early (simulating disconnect or break)
+    await stream.aclose()
